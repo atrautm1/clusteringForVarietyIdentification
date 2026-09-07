@@ -14,9 +14,95 @@ import scipy.cluster.hierarchy as sch
 import scripts.graphs as plot
 import scripts.randMatrix as rand
 import scripts.referenceProcessing
+from scripts.reduceDimensions import run_pca_and_select_markers
+from pathlib import Path
+import logging
+import time
+import joblib
+from hdbscan import HDBSCAN
+from sklearn.pipeline import Pipeline
+from scripts.consensusPurity import (
+    calculate_purity_single,
+    get_cluster_metrics,
+    calculate_purity_matrix,
+)
+
+# from pca import run_pca_and_select_markers
 
 
-def filterData(countsFile, metaFile, minloci, minSample, refFilter=None):
+# def filterData(countsFile, metaFile, minloci, minSample, refFilter=None):
+#     """
+#     Input the reformatted counts file and paired metadata file, filter out low quality samples/genes and then interpolate missing data
+
+#     Args:
+#         countsFile: path to reformatted counts file
+#         metaFile: path to the metadata file paired with the countsFile
+#         minSample: samples must be missing counts data from less than X proportion of markers
+#         minloci: markers must be have counts data from more than than Y proportion of samples
+#         refFilter: (optional) remove references with a divergence score above this value
+#     """
+#     # import counts data
+#     counts = pd.read_csv(countsFile, index_col="MarkerName")
+#     snpProportion = (
+#         counts.groupby(["MarkerName"]).first() / counts.groupby(["MarkerName"]).sum()
+#     )  # if the count for both SNPs are zero --> NaN
+
+#     # check that all marker names are unique
+#     marker, markerCount = np.unique(counts.index, return_counts=True)
+#     if len(np.where(markerCount > 2)[0]) > 0:
+#         raise ValueError(
+#             "More than two rows with the same marker name, please differentiate marker names in the count file"
+#         )
+
+#     # import sample metadata
+#     sampleMeta = pd.read_csv(metaFile)
+#     refRemove = sampleMeta[sampleMeta["reference"] == "REMOVE"][
+#         "short_name"
+#     ].values.astype("str")
+
+#     # optionally remove references above a divergence cutoff
+#     if refFilter:
+#         divergent = snpProportion.columns[
+#             plot.homozygousDivergence(snpProportion) > refFilter
+#         ].astype(
+#             "int"
+#         )  # all samples above cutoff
+#         references = sampleMeta[(sampleMeta["reference"].notna())]["short_name"].values
+#         refRemove = np.append(
+#             refRemove,
+#             sampleMeta[
+#                 sampleMeta["short_name"].isin(np.intersect1d(divergent, references))
+#             ]["short_name"].values.astype("str"),
+#         )
+
+#     snpProportion = snpProportion.drop(refRemove, axis=1)
+#     sampleMeta = sampleMeta.drop(
+#         sampleMeta[sampleMeta["short_name"].isin(refRemove.astype("int"))].index
+#     )
+
+#     snpProportionNoInterpolation = snpProportion.copy()
+
+#     # filter snpProportion for samples and genes with too many NaN
+#     snpProportion = snpProportion[
+#         snpProportion.isna().sum(axis=1) < (minloci * snpProportion.shape[1])
+#     ]  # remove genes
+#     snpProportion = snpProportion.drop(
+#         columns=snpProportion.columns[
+#             snpProportion.isna().sum(axis=0) > (minSample * snpProportion.shape[0])
+#         ]
+#     )  # remove samples
+
+#     # interpolate NaN using gene average
+#     snpProportion = snpProportion.where(
+#         pd.notna(snpProportion), snpProportion.mean(axis=1), axis="rows"
+#     )
+
+#     return snpProportion, snpProportionNoInterpolation, sampleMeta
+
+
+def filterData(
+    countsFile, metaFile, minloci, minSample, refFilter=None, metaFilter=None
+):
     """
     Input the reformatted counts file and paired metadata file, filter out low quality samples/genes and then interpolate missing data
 
@@ -26,6 +112,8 @@ def filterData(countsFile, metaFile, minloci, minSample, refFilter=None):
         minSample: samples must be missing counts data from less than X proportion of markers
         minloci: markers must be have counts data from more than than Y proportion of samples
         refFilter: (optional) remove references with a divergence score above this value
+        metaFilter: (optional) dictionary of metadata columns and values to filter by.
+                    e.g. {'Region': 'North', 'Batch': [1, 2, 3]}
     """
     # import counts data
     counts = pd.read_csv(countsFile, index_col="MarkerName")
@@ -42,6 +130,34 @@ def filterData(countsFile, metaFile, minloci, minSample, refFilter=None):
 
     # import sample metadata
     sampleMeta = pd.read_csv(metaFile)
+
+    # --- NEW: Filter based on dictionary provided in metaFilter ---
+    if metaFilter:
+        logging.info(f"Filtering on {metaFilter}")
+        for col, values in metaFilter.items():
+            if col in sampleMeta.columns:
+                # Ensure the values are in a list so we can use .isin()
+                if not isinstance(values, (list, tuple, set, np.ndarray)):
+                    values = [values]
+
+                # Filter the metadata dataframe
+                sampleMeta = sampleMeta[sampleMeta[col].isin(values)]
+            else:
+                print(
+                    f"Warning: Column '{col}' not found in metadata. Skipping this filter."
+                )
+
+        # Keep only the columns in snpProportion that correspond to the filtered short_names
+        # We convert to strings for safe matching between dataframes
+        kept_short_names = set(sampleMeta["short_name"].astype(str))
+        logging.info(kept_short_names)
+        cols_to_keep = [
+            col for col in snpProportion.columns if str(col) in kept_short_names
+        ]
+        logging.info(cols_to_keep)
+        snpProportion = snpProportion[cols_to_keep]
+    # -------------------------------------------------------------
+
     refRemove = sampleMeta[sampleMeta["reference"] == "REMOVE"][
         "short_name"
     ].values.astype("str")
@@ -61,7 +177,8 @@ def filterData(countsFile, metaFile, minloci, minSample, refFilter=None):
             ]["short_name"].values.astype("str"),
         )
 
-    snpProportion = snpProportion.drop(refRemove, axis=1)
+    # Added errors="ignore" to prevent KeyErrors if reference columns were already dropped
+    snpProportion = snpProportion.drop(refRemove, axis=1, errors="ignore")
     sampleMeta = sampleMeta.drop(
         sampleMeta[sampleMeta["short_name"].isin(refRemove.astype("int"))].index
     )
@@ -86,6 +203,149 @@ def filterData(countsFile, metaFile, minloci, minSample, refFilter=None):
     return snpProportion, snpProportionNoInterpolation, sampleMeta
 
 
+def updatedFilterData(countsFile, metaFile, minloci, minSample, refFilter=None):
+    """
+    Input the reformatted counts file and paired metadata file, filter out low quality samples/genes,
+    convert to a discrete genotype matrix (0, 1, 2), and then interpolate missing data.
+    IN BETA
+
+    Args:
+        countsFile: path to reformatted counts file
+        metaFile: path to the metadata file paired with the countsFile
+        minSample: samples must be missing counts data from less than X proportion of markers
+        minloci: markers must be have counts data from more than than Y proportion of samples
+        refFilter: (optional) remove references with a divergence score above this value
+    """
+    # import counts data
+    counts = pd.read_csv(countsFile, index_col="MarkerName")
+
+    # Isolate reference (first row) and alternate (last row) counts per marker
+    grouped_counts = counts.groupby(["MarkerName"])
+    ref_counts = grouped_counts.first()
+    alt_counts = grouped_counts.last()
+
+    # Build the genotype matrix
+    genotype = pd.DataFrame(np.nan, index=ref_counts.index, columns=ref_counts.columns)
+    genotype[(ref_counts > 0) & (alt_counts == 0)] = 0  # Homozygous Reference
+    genotype[(ref_counts > 0) & (alt_counts > 0)] = 1  # Heterozygous
+    genotype[(ref_counts == 0) & (alt_counts > 0)] = 2  # Homozygous Alternate
+    # Note: where ref == 0 and alt == 0, it naturally remains NaN
+
+    # check that all marker names are unique
+    _, markerCount = np.unique(counts.index, return_counts=True)
+    if len(np.where(markerCount > 2)[0]) > 0:
+        raise ValueError(
+            "More than two rows with the same marker name, please differentiate marker names in the count file"
+        )
+
+    # import sample metadata
+    sampleMeta = pd.read_csv(metaFile)
+    refRemove = sampleMeta[sampleMeta["reference"] == "REMOVE"][
+        "short_name"
+    ].values.astype("str")
+
+    # optionally remove references above a divergence cutoff
+    if refFilter:
+        # Calculate proportion locally JUST for the divergence function so we don't break it
+        tempProportion = ref_counts / (ref_counts + alt_counts)
+        divergent = tempProportion.columns[
+            plot.homozygousDivergence(tempProportion) > refFilter
+        ].astype(
+            "int"
+        )  # all samples above cutoff
+
+        references = sampleMeta[(sampleMeta["reference"].notna())]["short_name"].values
+        refRemove = np.append(
+            refRemove,
+            sampleMeta[
+                sampleMeta["short_name"].isin(np.intersect1d(divergent, references))
+            ]["short_name"].values.astype("str"),
+        )
+
+    genotype = genotype.drop(refRemove, axis=1)
+    sampleMeta = sampleMeta.drop(
+        sampleMeta[sampleMeta["short_name"].isin(refRemove.astype("int"))].index
+    )
+
+    genotypeNoInterpolation = genotype.copy()
+
+    # filter genotype for samples and genes with too many NaN
+    genotype = genotype[
+        genotype.isna().sum(axis=1) < (minloci * genotype.shape[1])
+    ]  # remove genes
+    genotype = genotype.drop(
+        columns=genotype.columns[
+            genotype.isna().sum(axis=0) > (minSample * genotype.shape[0])
+        ]
+    )  # remove samples
+
+    # interpolate NaN using gene average
+    # Note: This will introduce floats (e.g., 0.8 or 1.2) into the 0,1,2 matrix
+    genotype = genotype.where(pd.notna(genotype), genotype.mean(axis=1), axis="rows")
+
+    return genotype, genotypeNoInterpolation, sampleMeta
+
+
+def generateGenotypeMatrix(countsFile, metaFile, minloci, minSample, refFilter=None):
+    """
+    Input the reformatted counts file and paired metadata file, filter out low quality samples/genes,
+    convert to a discrete genotype matrix (0, 1, 2), and then interpolate missing data.
+
+    Args:
+        countsFile: path to reformatted counts file
+        metaFile: path to the metadata file paired with the countsFile
+        minSample: samples must be missing counts data from less than X proportion of markers
+        minloci: markers must be have counts data from more than than Y proportion of samples
+        refFilter: (optional) remove references with a divergence score above this value
+    """
+    # import counts data
+    counts = pd.read_csv(countsFile, index_col="MarkerName")
+
+    # Isolate reference (first row) and alternate (last row) counts per marker
+    grouped_counts = counts.groupby(["MarkerName"])
+    ref_counts = grouped_counts.first()
+    alt_counts = grouped_counts.last()
+
+    # Build the genotype matrix
+    genotype = pd.DataFrame(np.nan, index=ref_counts.index, columns=ref_counts.columns)
+    genotype[(ref_counts > 0) & (alt_counts == 0)] = 0  # Homozygous Reference
+    genotype[(ref_counts > 0) & (alt_counts > 0)] = 1  # Heterozygous
+    genotype[(ref_counts == 0) & (alt_counts > 0)] = 2  # Homozygous Alternate
+    # Note: where ref == 0 and alt == 0, it naturally remains NaN
+
+    # check that all marker names are unique
+    _, markerCount = np.unique(counts.index, return_counts=True)
+    if len(np.where(markerCount > 2)[0]) > 0:
+        raise ValueError(
+            "More than two rows with the same marker name, please differentiate marker names in the count file"
+        )
+
+    # import sample metadata
+    sampleMeta = pd.read_csv(metaFile)
+    refRemove = sampleMeta[sampleMeta["reference"] == "REMOVE"][
+        "short_name"
+    ].values.astype("str")
+
+    genotype = genotype.drop(refRemove, axis=1)
+    sampleMeta = sampleMeta.drop(
+        sampleMeta[sampleMeta["short_name"].isin(refRemove.astype("int"))].index
+    )
+
+    genotypeNoInterpolation = genotype.copy()
+
+    # filter genotype for samples and genes with too many NaN
+    genotype = genotype[
+        genotype.isna().sum(axis=1) < (minloci * genotype.shape[1])
+    ]  # remove genes
+    genotype = genotype.drop(
+        columns=genotype.columns[
+            genotype.isna().sum(axis=0) > (minSample * genotype.shape[0])
+        ]
+    )
+
+    return genotype, sampleMeta
+
+
 def embedData(snpProportion, umapSeed):
     """
     Input the processed snpProportion data, embed with UMAP, and then cluster using DBSCAN
@@ -100,11 +360,11 @@ def embedData(snpProportion, umapSeed):
         snpProportion.T
     )  # the order is the same after embedding
 
-    return embedding
+    return embedding, reducer
 
 
 def clusteringDBSCAN(
-    snpProportion, sampleMeta, embedding, epsilon, filePrefix, admixedCutoff
+    snpProportion, sampleMeta, embedding, epsilon, filePrefix, admixedCutoff, outputDir
 ):
     """
     Input the processed snpProprtion data, embed with UMAP, and then cluster using DBSCAN
@@ -121,25 +381,85 @@ def clusteringDBSCAN(
 
     # save output figures
     plot.umapCluster(embedding, db_communities)
-    plt.savefig(filePrefix + " UMAP DBSCAN (epsilon " + str(epsilon) + ").png", dpi=300)
+    plt.savefig(
+        Path(outputDir).joinpath(f"{filePrefix} UMAP DBSCAN (epsilon {epsilon}).png"),
+        dpi=300,
+    )
     plt.close()
 
     plot.umapReference(snpProportion, embedding, sampleMeta, db_communities)
     plt.savefig(
-        filePrefix
-        + " UMAP references (DBSCAN clusters, epsilon "
-        + str(epsilon)
-        + ").png",
+        Path(outputDir).joinpath(
+            f"{filePrefix} UMAP references (DBSCAN clusters, epsilon {epsilon}).png",
+        ),
         dpi=300,
     )
     plt.close()
 
     if admixedCutoff:
         plot.histogramDivergence(snpProportion, sampleMeta)
-        plt.savefig(filePrefix + " histogram divergence.png", dpi=300)
+        plt.savefig(
+            Path(outputDir).joinpath(f"{filePrefix} histogram divergence.png"), dpi=300
+        )
         plt.close()
 
     return db_communities
+
+
+def clusteringHDBSCAN(
+    snpProportion,
+    sampleMeta,
+    embedding,
+    min_cluster_size,
+    filePrefix,
+    admixedCutoff,
+    outputDir,
+):
+    """
+    Input the processed snpProportion data, embed with UMAP, and then cluster using HDBSCAN.
+
+    Args:
+        snpProportion: processed SNP proportion data
+        sampleMeta: metadata paired with genotyping data
+        embedding: UMAP embedding of snpProportion
+        min_cluster_size: minimum number of samples in a group for it to be considered a cluster
+        filePrefix: prefix for output filenames
+        admixedCutoff: threshold/boolean for plotting histogram divergence
+    """
+    # Cluster using HDBSCAN
+    hdbs = HDBSCAN(min_cluster_size=min_cluster_size, prediction_data=True).fit(
+        embedding
+    )
+    # hdbs = HDBSCAN(min_cluster_size=min_cluster_size).fit(embedding)
+    hdb_communities = hdbs.labels_
+    logging.info(hdbs.probabilities_)
+
+    plot.umapCluster(embedding, hdb_communities)
+    plt.savefig(
+        Path(outputDir).joinpath(
+            f"{filePrefix} UMAP HDBSCAN (min_cluster_size {min_cluster_size}).png",
+        ),
+        dpi=300,
+    )
+    plt.close()
+
+    plot.umapReference(snpProportion, embedding, sampleMeta, hdb_communities)
+    plt.savefig(
+        Path(outputDir).joinpath(
+            f"{filePrefix} UMAP references HDBSCAN (min_cluster_size {min_cluster_size}).png",
+        ),
+        dpi=300,
+    )
+    plt.close()
+
+    if admixedCutoff:
+        plot.histogramDivergence(snpProportion, sampleMeta)
+        plt.savefig(
+            Path(outputDir).joinpath(f"{filePrefix} histogram divergence.png"), dpi=300
+        )
+        plt.close()
+
+    return hdbs, hdb_communities
 
 
 def evaluateEpsilon(
@@ -164,6 +484,7 @@ def evaluateEpsilon(
     )  # Range of epsilon values for DBSCAN
     rand.randScoreMatrix(embedding, ks, "DBSCAN")
     plt.savefig(filePrefix + " DBSCAN rand matrix.png", dpi=300)
+    plt.close()
 
 
 def labelSamples(
@@ -176,6 +497,8 @@ def labelSamples(
     filePrefix,
     snpProportionNoInterpolation,
     parameterFile,
+    outputDir,
+    probabilities=None,
 ):
     """
     Evaluate different cut height values for processing the dendrogram
@@ -193,6 +516,7 @@ def labelSamples(
     output = pd.DataFrame(embedding, columns=["embedding_X", "embedding_Y"])
     output["cluster"] = db_communities
     output["short_name"] = snpProportion.columns
+    output["probabilities"] = probabilities
     if admixedCutoff:
         output["divergence"] = plot.homozygousDivergence(snpProportion)
     output["variety"] = pd.NA
@@ -201,7 +525,7 @@ def labelSamples(
         # subset for a single DBSCAN cluster
         subsetIndex = np.where(db_communities == cluster)[0]
 
-        # cluster subset of samples using heirarchical clustering
+        # cluster subset of samples using hierarchical clustering
         Y_cluster = sch.linkage(
             snpProportion[snpProportion.columns[subsetIndex]].values.T,
             metric="correlation",
@@ -222,23 +546,27 @@ def labelSamples(
         output.loc[subsetIndex, "variety"] = varietiesList
 
     # save outputs
-    plot.umapRefLandrace(snpProportion, output, sampleMeta, 5, noRef=True)
-    plt.savefig(
-        filePrefix
-        + " UMAP clustering predictions (cut height"
-        + str(cutHeight)
-        + ").png",
-        dpi=300,
+    logging.debug(f"DEBUG snpProportion.shape: {snpProportion.shape}")
+    logging.debug(f"DEBUG output.shape: {output.shape}")
+    logging.debug(f"DEBUG sampleMeta.shape: {sampleMeta.shape}")
+    logging.debug(f"DEBUG output.variety unique: {output['variety'].unique()[:10]}")
+
+    fig_title = f"UMAP clustering predictions (cut height {cutHeight})"
+    plot.umapRefLandrace(
+        snpProportion, output, sampleMeta, 5, noRef=True, fig_title=fig_title
     )
+    logging.debug(f"DEBUG umapRefLandrace artists: {plt.gca().get_children()[:10]}")
 
     plot.barchartRef(snpProportion, output, sampleMeta)
+    logging.debug(f"DEBUG barchartRef artists: {plt.gca().get_children()[:10]}")
+
     plt.savefig(
-        filePrefix
-        + " bar chart clustering predictions (cut height"
-        + str(cutHeight)
-        + ").png",
+        Path(outputDir).joinpath(
+            f"{filePrefix}_barChart_clusteringPredictions_cutHeight{cutHeight}.png",
+        ),
         dpi=300,
     )
+    plt.close()
 
     # add missingness
     output["missingness"] = (
@@ -253,7 +581,9 @@ def labelSamples(
     ).values
 
     output.to_csv(
-        filePrefix + "_clusteringOutputData_cutHeight" + str(cutHeight) + ".csv",
+        Path(outputDir).joinpath(
+            f"{filePrefix}_clusteringOutputData_cutHeight{cutHeight}.csv"
+        ),
         index=False,
     )
 
@@ -266,7 +596,7 @@ def labelSamples(
     sampleMetaCrop.index = output.index
     output2 = pd.concat([output, sampleMetaCrop], axis=1)
 
-    # add paramters
+    # add parameters
     with open(parameterFile) as f:
         data = json.load(f)
 
@@ -333,7 +663,16 @@ def loadParameters(parameterFile):
         raise ValueError("filePrefix must be a string")
 
     inputCountsFile = data.get("inputCountsFile", None)
+    if not Path(inputCountsFile).exists():
+        raise ValueError(f"inputCountsFile must exist. I got {inputCountsFile}")
+
     inputMetaFile = data.get("inputMetaFile", None)
+    if not Path(inputMetaFile).exists():
+        raise ValueError(f"inputMetaFile must exist. I got {inputMetaFile}")
+
+    outputDir = data.get("outputDir", None)
+    if not Path(outputDir).exists():
+        Path(outputDir).mkdir(parents=True, exist_ok=True)
 
     return (
         minSample,
@@ -345,11 +684,30 @@ def loadParameters(parameterFile):
         filePrefix,
         inputCountsFile,
         inputMetaFile,
+        outputDir,
     )
 
 
-def runPipeline(parameterFile):
-    # Load the parameters from the JSON file
+def initLogging(outputdir, verbose=False):
+    if verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
+    logging.basicConfig(
+        filename=outputdir + "/app.log",
+        filemode="a",  # 'a' to append logs, 'w' to overwrite every run
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        level=level,
+    )
+
+
+def runPipeline(
+    parameterFile,
+    pipelineName="clusteringForVarietyIdentification",
+    verbose=False,
+    method=2,
+):
     (
         minSample,
         minloci,
@@ -360,44 +718,766 @@ def runPipeline(parameterFile):
         filePrefix,
         inputCountsFile,
         inputMetaFile,
+        outputDir,
     ) = loadParameters(parameterFile)
 
-    # Filter the data based on the provided parameters
-    snpProportion, snpProportionNoInterpolation, sampleMeta = filterData(
-        inputCountsFile, inputMetaFile, minloci, minSample
-    )
+    initLogging(outputDir, verbose=verbose)
 
-    # Embed the filtered data using UMAP
-    # i.e., reduce the dimensionality of the data for clustering
-    embedding = embedData(snpProportion, umapSeed)
-
-    print(embedding)
-    # Cluster the embedded data using DBSCAN
-    db_communities = clusteringDBSCAN(
-        snpProportion, sampleMeta, embedding, epsilon, filePrefix, admixedCutoff
+    time_stamp = time.localtime(time.time())
+    logging.info(
+        f"----------------- {time.strftime('%Y-%m-%d %H:%M:%S', time_stamp)} -----------------"
     )
+    logging.info(f"Running pipeline: {pipelineName}")
 
-    # Label the samples based on the clustering results
-    output, output2 = labelSamples(
-        snpProportion,
-        sampleMeta,
-        db_communities,
-        embedding,
-        cutHeight,
-        admixedCutoff,
-        filePrefix,
-        snpProportionNoInterpolation,
-        parameterFile,
-    )
+    match pipelineName:
+        case "clusteringForVarietyIdentification":
+            # Load and validate he parameters from the JSON file
+            (
+                minSample,
+                minloci,
+                umapSeed,
+                epsilon,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                inputCountsFile,
+                inputMetaFile,
+                outputDir,
+            ) = loadParameters(parameterFile)
+            # Filter the data based on the provided parameters
+            snpProportion, snpProportionNoInterpolation, sampleMeta = filterData(
+                inputCountsFile, inputMetaFile, minloci, minSample
+            )
 
-    return (
-        snpProportion,
-        snpProportionNoInterpolation,
-        sampleMeta,
-        embedding,
-        db_communities,
-        output,
-    )
+            # Embed the filtered data using UMAP
+            # i.e., reduce the dimensionality of the data for clustering
+            embedding = embedData(snpProportion, umapSeed)
+
+            # Cluster the embedded data using DBSCAN
+            db_communities = clusteringDBSCAN(
+                snpProportion,
+                sampleMeta,
+                embedding,
+                epsilon,
+                filePrefix,
+                admixedCutoff,
+                outputDir=outputDir,
+            )
+
+            # Label the samples based on the clustering results
+            output, output2 = labelSamples(
+                snpProportion,
+                sampleMeta,
+                db_communities,
+                embedding,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                snpProportionNoInterpolation,
+                parameterFile,
+                outputDir=outputDir,
+            )
+        case "revisedClusteringForVarietyIdentification":
+            # Load and validate he parameters from the JSON file
+            (
+                minSample,
+                minloci,
+                umapSeed,
+                epsilon,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                inputCountsFile,
+                inputMetaFile,
+                outputDir,
+            ) = loadParameters(parameterFile)
+
+            # Filter the data based on the provided parameters
+            snpProportion, snpProportionNoInterpolation, sampleMeta = filterData(
+                inputCountsFile, inputMetaFile, minloci, minSample
+            )
+
+            snpProportion = run_pca_and_select_markers(
+                snpProportion, n_keep=0.9, filePrefix=filePrefix, outputDir=outputDir
+            )
+
+            # Embed the filtered data using UMAP
+            # i.e., reduce the dimensionality of the data for clustering
+            embedding = embedData(snpProportion, umapSeed)
+
+            # Cluster the embedded data using HDBSCAN
+            db_communities = clusteringHDBSCAN(
+                snpProportion,
+                sampleMeta,
+                embedding,
+                3,
+                filePrefix,
+                admixedCutoff,
+                outputDir=outputDir,
+            )
+
+            # Label the samples based on the clustering results
+            output, output2 = labelSamples(
+                snpProportion,
+                sampleMeta,
+                db_communities,
+                embedding,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                snpProportionNoInterpolation,
+                parameterFile,
+                outputDir=outputDir,
+            )
+        case "genotypeClusteringForPurityCalculationOriginal":
+            # Eventually give these as a pass through option
+            hdbscan_output_dir = Path(outputDir).joinpath(
+                f".ckpt2_{filePrefix}_hdbscan_model.joblib"
+            )
+            genotype_matrix_dir = Path(outputDir).joinpath(
+                f".ckpt3_{filePrefix}_genotype_matrix.pkl"
+            )
+            # Load and validate he parameters from the JSON file
+            (
+                minSample,
+                minloci,
+                umapSeed,
+                epsilon,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                inputCountsFile,
+                inputMetaFile,
+                outputDir,
+            ) = loadParameters(parameterFile)
+
+            snpProportion, snpProportionNoInterpolation, sampleMeta = filterData(
+                inputCountsFile, inputMetaFile, minloci, minSample
+            )
+
+            # Embed the filtered data using UMAP
+            # i.e., reduce the dimensionality of the data for clustering
+            embedding, _ = embedData(snpProportion, umapSeed)
+
+            # Cluster the embedded data using DBSCAN
+            db_communities = clusteringDBSCAN(
+                snpProportion,
+                sampleMeta,
+                embedding,
+                epsilon,
+                filePrefix,
+                admixedCutoff,
+                outputDir=outputDir,
+            )
+
+            # Label the samples based on the clustering results
+            output, _ = labelSamples(
+                snpProportion,
+                sampleMeta,
+                db_communities,
+                embedding,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                snpProportionNoInterpolation,
+                parameterFile,
+                outputDir=outputDir,
+            )
+
+            # If this is put in an interface in the future that is publically accessible,
+            # consider using a more secure method of storing the output.
+            output.to_pickle(
+                Path(outputDir).joinpath(f"{filePrefix}_clustering_output.pkl")
+            )
+
+            group_assignments = output[["cluster", "short_name", "variety"]]
+
+            if not genotype_matrix_dir.exists():
+                # Update to take/load from stored file
+                genotypeMatrix, sampleMeta = generateGenotypeMatrix(
+                    inputCountsFile, inputMetaFile, minloci, minSample
+                )
+
+                genotypeMatrix.to_pickle(genotype_matrix_dir)
+            else:
+                logging.info(
+                    f"Loading genotype matrix from file. {genotype_matrix_dir}"
+                )
+                genotypeMatrix = pd.read_pickle(genotype_matrix_dir)
+
+            # Group the lines by the group assignments and build the consensus.
+            df_geno_t = genotypeMatrix.T
+
+            # Map the cluster assignments to the index using the short_name
+            cluster_mapping = group_assignments.set_index("short_name")["cluster"]
+            df_geno_t["cluster"] = df_geno_t.index.map(cluster_mapping)
+
+            # Group by cluster and calculate the mode
+            # We use a lambda to handle ties (it picks the first mode if multiple exist) and NaNs
+            consensus_matrix_t = df_geno_t.groupby("cluster").agg(
+                lambda x: x.mode()[0] if not x.mode().empty else np.nan
+            )
+
+            cluster_map = group_assignments.set_index("short_name")["cluster"].to_dict()
+            purity_results = []
+
+            for line_id, raw_geno_values in df_geno_t.iterrows():
+                assigned_cluster = cluster_map.get(line_id)
+
+                if (
+                    pd.isna(assigned_cluster)
+                    or assigned_cluster not in consensus_matrix_t.index
+                ):
+                    continue
+
+                consensus_values = consensus_matrix_t.loc[assigned_cluster]
+
+                # 4. Pass both Pandas Series into the purity method
+                purity_pct = calculate_purity(raw_geno_values, consensus_values)
+
+                # Store the results
+                purity_results.append(
+                    {
+                        "short_name": line_id,
+                        "assigned_cluster": assigned_cluster,
+                        "purity_pct": purity_pct,
+                    }
+                )
+
+            # 5. Convert back to a DataFrame
+            df_purity_scores = pd.DataFrame(purity_results)
+
+            print(df_purity_scores)
+
+            df_purity_scores.to_csv(
+                Path(outputDir).joinpath(f"{filePrefix}_purity_scores.csv")
+            )
+        case "genotypeClusteringForPurityCalculationNoPCA":
+            # Eventually give these as a pass through option
+            hdbscan_output_dir = Path(outputDir).joinpath(
+                f".ckpt2_{filePrefix}_hdbscan_model.joblib"
+            )
+            genotype_matrix_dir = Path(outputDir).joinpath(
+                f".ckpt3_{filePrefix}_genotype_matrix.pkl"
+            )
+            # Load and validate he parameters from the JSON file
+            (
+                minSample,
+                minloci,
+                umapSeed,
+                epsilon,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                inputCountsFile,
+                inputMetaFile,
+                outputDir,
+            ) = loadParameters(parameterFile)
+
+            # Filter the data based on the provided parameters
+            snpProportion, snpProportionNoInterpolation, sampleMeta = filterData(
+                inputCountsFile, inputMetaFile, minloci, minSample
+            )
+
+            # Embed the filtered data using UMAP
+            # ..further reduce the dimensionality of the data for clustering
+            embedding, umap_reducer = embedData(snpProportion, umapSeed)
+            joblib.dump(
+                umap_reducer,
+                Path(outputDir).joinpath(f".pre2_{filePrefix}_umap.joblib"),
+            )
+            # TODO: Implement hdbscan native (non sklearn method)
+            if hdbscan_output_dir.exists():
+                logging.info(f"Loading hdbscan from checkpoint... {hdbscan_output_dir}")
+                hdbs = joblib.load(hdbscan_output_dir)
+                db_communities = hdbs.labels_
+            else:
+                # Cluster the embedded data using HDBSCAN
+                # Current implementation uses a minimum cluster size of 3, but this could be parameterized in the future.
+                hdbs, db_communities = clusteringHDBSCAN(
+                    snpProportion,
+                    sampleMeta,
+                    embedding,
+                    3,
+                    filePrefix,
+                    admixedCutoff,
+                    outputDir=outputDir,
+                )
+
+                joblib.dump(hdbs, hdbscan_output_dir)
+
+            # Label the samples based on the clustering results
+            output, _ = labelSamples(
+                snpProportion,
+                sampleMeta,
+                db_communities,
+                embedding,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                snpProportionNoInterpolation,
+                parameterFile,
+                outputDir=outputDir,
+            )
+
+            # If this is put in an interface in the future that is publically accessible,
+            # consider using a more secure method of storing the output.
+            output.to_pickle(
+                Path(outputDir).joinpath(f"{filePrefix}_clustering_output.pkl")
+            )
+
+            group_assignments = output[["cluster", "short_name", "variety"]]
+
+            if not genotype_matrix_dir.exists():
+                # Update to take/load from stored file
+                genotypeMatrix, sampleMeta = generateGenotypeMatrix(
+                    inputCountsFile, inputMetaFile, minloci, minSample
+                )
+
+                genotypeMatrix.to_pickle(genotype_matrix_dir)
+            else:
+                logging.info(
+                    f"Loading genotype matrix from file. {genotype_matrix_dir}"
+                )
+                genotypeMatrix = pd.read_pickle(genotype_matrix_dir)
+
+            # Group the lines by the group assignments and build the consensus.
+            df_geno_t = genotypeMatrix.T
+
+            # Map the cluster assignments to the index using the short_name
+            cluster_mapping = group_assignments.set_index("short_name")["cluster"]
+            df_geno_t["cluster"] = df_geno_t.index.map(cluster_mapping)
+
+            # Group by cluster and calculate the mode
+            # We use a lambda to handle ties (it picks the first mode if multiple exist) and NaNs
+            consensus_matrix_t = df_geno_t.groupby("cluster").agg(
+                lambda x: x.mode()[0] if not x.mode().empty else np.nan
+            )
+
+            cluster_map = group_assignments.set_index("short_name")["cluster"].to_dict()
+            purity_results = []
+
+            for line_id, raw_geno_values in df_geno_t.iterrows():
+                assigned_cluster = cluster_map.get(line_id)
+
+                if (
+                    pd.isna(assigned_cluster)
+                    or assigned_cluster not in consensus_matrix_t.index
+                ):
+                    continue
+
+                consensus_values = consensus_matrix_t.loc[assigned_cluster]
+
+                # 4. Pass both Pandas Series into the purity method
+                purity_pct = calculate_purity(raw_geno_values, consensus_values)
+
+                # Store the results
+                purity_results.append(
+                    {
+                        "short_name": line_id,
+                        "assigned_cluster": assigned_cluster,
+                        "purity_pct": purity_pct,
+                    }
+                )
+
+            # 5. Convert back to a DataFrame
+            df_purity_scores = pd.DataFrame(purity_results)
+
+            print(df_purity_scores)
+
+            df_purity_scores.to_csv(
+                Path(outputDir).joinpath(f"{filePrefix}_purity_scores.csv")
+            )
+        case "genotypeClusteringForPurityCalculation":
+            # Eventually give these as a pass through option
+            pca_marker_output = Path(outputDir).joinpath(
+                f".ckpt1_{filePrefix}_pca_markers.pkl"
+            )
+            hdbscan_output_dir = Path(outputDir).joinpath(
+                f".ckpt2_{filePrefix}_hdbscan_model.joblib"
+            )
+            genotype_matrix_dir = Path(outputDir).joinpath(
+                f".ckpt3_{filePrefix}_genotype_matrix.pkl"
+            )
+            # Load and validate he parameters from the JSON file
+            (
+                minSample,
+                minloci,
+                umapSeed,
+                epsilon,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                inputCountsFile,
+                inputMetaFile,
+                outputDir,
+            ) = loadParameters(parameterFile)
+
+            # Filter the data based on the provided parameters
+            snpProportion, snpProportionNoInterpolation, sampleMeta = filterData(
+                inputCountsFile,
+                inputMetaFile,
+                minloci,
+                minSample,
+                metaFilter={
+                    # "Study": "Innovation Pilot GRL",
+                    # "Comments": "Single Plant Sample ",
+                    "Sample Composition": "SinglePlant",
+                },
+            )
+            # convert to actual pipeline...
+            # dim_reduction_pipeline = Pipeline([
+            #     ('pca', PCA(n_components=50)),
+            #     ('umap', UMAP(n_neighbors=15, min_dist=0.0, n_components=5))
+            # ])
+            logging.info(snpProportion)
+            if not pca_marker_output.exists():
+                # Update method to select markers based on some criteria other than passing through
+                # at least 0.9 of the variance.
+                snpProportionPCA, pca = run_pca_and_select_markers(
+                    snpProportion,
+                    n_keep=0.9,
+                    filePrefix=filePrefix,
+                    outputDir=outputDir,
+                )
+                snpProportionPCA.to_pickle(pca_marker_output)
+                joblib.dump(
+                    pca, Path(outputDir).joinpath(f".pre1_{filePrefix}_pca.joblib")
+                )
+            else:
+                logging.info(
+                    f"Skipping PCA run as dimensions have already been reduced here.. {pca_marker_output}"
+                )
+
+                snpProportionPCA = pd.read_pickle(pca_marker_output)
+            logging.info(f"snpProportion is: {snpProportion.head()}")
+            logging.info(f"snpProportionPCA is: {snpProportionPCA.head()}")
+            # Embed the filtered data using UMAP
+            # ..further reduce the dimensionality of the data for clustering
+            embedding, umap_reducer = embedData(snpProportionPCA, umapSeed)
+            joblib.dump(
+                umap_reducer,
+                Path(outputDir).joinpath(f".pre2_{filePrefix}_umap.joblib"),
+            )
+
+            if hdbscan_output_dir.exists():
+                logging.info(f"Loading hdbscan from checkpoint... {hdbscan_output_dir}")
+                hdbs = joblib.load(hdbscan_output_dir)
+                db_communities = hdbs.labels_
+                logging.info(hdbs.probabilities_)
+            else:
+                # Cluster the embedded data using HDBSCAN
+                # Current implementation uses a minimum cluster size of 3, but this could be parameterized in the future.
+                hdbs, db_communities = clusteringHDBSCAN(
+                    snpProportionPCA,
+                    sampleMeta,
+                    embedding,
+                    3,
+                    filePrefix,
+                    admixedCutoff,
+                    outputDir=outputDir,
+                )
+
+                joblib.dump(hdbs, hdbscan_output_dir)
+
+            # Label the samples based on the clustering results
+            output, _ = labelSamples(
+                snpProportionPCA,
+                sampleMeta,
+                db_communities,
+                embedding,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                snpProportionNoInterpolation,
+                parameterFile,
+                outputDir=outputDir,
+                probabilities=hdbs.probabilities_,
+            )
+            # If this is put in an interface in the future that is publically accessible,
+            # consider using a more secure method of storing the output.
+            output.to_pickle(
+                Path(outputDir).joinpath(f"{filePrefix}_clustering_output.pkl")
+            )
+
+            # Get the cluster metrics.. These should output entropy, purity
+            # of the cluster or group assignments specifically.
+            group_assignments = output[["cluster", "short_name", "variety"]]
+            sampleMeta["short_name"] = sampleMeta["short_name"].astype(str)
+            group_to_cluster = pd.merge(
+                group_assignments[["short_name", "cluster"]],
+                sampleMeta[["short_name", "reference"]],
+                on="short_name",
+                how="inner",  # 'inner' keeps only matching rows in both DataFrames
+            )
+            group_to_cluster.rename(columns={"reference": "variety"}, inplace=True)
+            group_to_cluster["variety"].fillna("Group 0", inplace=True)
+            total_class_counts = group_to_cluster["variety"].value_counts()
+            cluster_metrics = get_cluster_metrics(group_to_cluster, total_class_counts)
+
+            cluster_metrics.to_csv(
+                Path(outputDir).joinpath(f"{filePrefix}_cluster_metrics.csv")
+            )
+            match method:
+                case 1:
+                    logging.info(
+                        "Running with method 1: calling genotypes from counts file."
+                    )
+                    ## Consensus part.. Generate a consensus genotype 0,1,2
+                    if not genotype_matrix_dir.exists():
+                        # Update to take/load from stored file
+                        genotypeMatrix, sampleMeta = generateGenotypeMatrix(
+                            inputCountsFile, inputMetaFile, minloci, minSample
+                        )
+
+                        genotypeMatrix.to_pickle(genotype_matrix_dir)
+                    else:
+                        logging.info(
+                            f"Loading genotype matrix from file. {genotype_matrix_dir}"
+                        )
+                        genotypeMatrix = pd.read_pickle(genotype_matrix_dir)
+                case 2:
+                    # ##
+                    # # Method #2 use dartseq called genotypes...
+                    logging.info("Running with method 2: Using called genotypes.")
+                    geno_call_file = "./wheat_full/merged_genotypes_master.csv"
+                    logging.info(f"loading from file: {geno_call_file}")
+                    genotypeMatrix = pd.read_csv(geno_call_file, index_col="MarkerName")
+                    genotypeMatrix.replace("-", np.nan, inplace=True)
+                    print(f"Genotype Matrix is:\n {genotypeMatrix}")
+                case 3:
+                    logging.info("Running with method 3: Using snpProportions")
+                    # # Method #3 use the snpProportions from the PCA step
+                    genotypeMatrix = snpProportionPCA
+                    genotypeMatrix.sort_index(inplace=True)
+
+            # Filter the genotype matrix by the identified markers in the PCA step
+            filtered_df = genotypeMatrix[
+                genotypeMatrix.index.isin(snpProportionPCA.index)
+            ]
+
+            # Group the lines by the group assignments and build the consensus.
+            df_geno_t = filtered_df.T
+
+            # Map the cluster assignments to the index using the short_name
+            cluster_mapping = group_assignments.set_index("short_name")["cluster"]
+            df_geno_t["cluster"] = df_geno_t.index.map(cluster_mapping)
+
+            # Group by cluster and calculate the mode
+            # We use a lambda to handle ties (it picks the first mode if multiple exist) and NaNs
+            consensus_matrix_t = df_geno_t.groupby("cluster").agg(
+                lambda x: x.mode()[0] if not x.mode().empty else np.nan
+            )
+            # Create a mapping dictionary of {cluster_num: majority_class}
+            majority_map = cluster_metrics["Majority_Class"].to_dict()
+
+            # Map the majority class directly using the cluster column
+            consensus_matrix_t.insert(
+                0, "Majority_Class", consensus_matrix_t.index.map(majority_map)
+            )
+
+            consensus_matrix_t.to_csv(
+                Path(outputDir).joinpath(f"{filePrefix}_consensus.csv")
+            )
+            # Transpose back: Rows are Markers, Columns are Clusters
+            # consensus_matrix = consensus_matrix_t.T
+
+            cluster_map = group_assignments.set_index("short_name")["cluster"].to_dict()
+            purity_results = []
+
+            for line_id, raw_geno_values in df_geno_t.iterrows():
+                assigned_cluster = cluster_map.get(line_id)
+
+                if (
+                    pd.isna(assigned_cluster)
+                    or assigned_cluster not in consensus_matrix_t.index
+                ):
+                    continue
+
+                consensus_values = consensus_matrix_t.loc[assigned_cluster]
+
+                # 4. Pass both Pandas Series into the purity method
+                purity_pct = calculate_purity_single(raw_geno_values, consensus_values)
+
+                # Store the results
+                purity_results.append(
+                    {
+                        "short_name": line_id,
+                        "assigned_cluster": assigned_cluster,
+                        "purity_pct": purity_pct,
+                    }
+                )
+
+            # 5. Convert back to a DataFrame
+            df_purity_scores = pd.DataFrame(purity_results)
+
+            df_purity_scores.to_csv(
+                Path(outputDir).joinpath(f"{filePrefix}_purity_scores.csv")
+            )
+
+            total_class_counts = df_purity_scores["variety"].value_counts()
+            get_cluster_metrics()
+        case "purityCalculationFromConsensus":
+            (
+                minSample,
+                minloci,
+                umapSeed,
+                epsilon,
+                cutHeight,
+                admixedCutoff,
+                filePrefix,
+                inputCountsFile,
+                inputMetaFile,
+                outputDir,
+            ) = loadParameters(parameterFile)
+
+            # Method #1
+            # genotypeMatrix, sampleMeta = generateGenotypeMatrix(
+            #     inputCountsFile, inputMetaFile, minloci, minSample
+            # )
+
+            # Method #2
+            geno_call_file = "./wheat_full/merged_genotypes_master.csv"
+            logging.info(f"loading from file: {geno_call_file}")
+            genotypeMatrix = pd.read_csv(geno_call_file, index_col="MarkerName")
+            genotypeMatrix.replace("-", np.nan, inplace=True)
+            sampleMeta = pd.read_csv(inputMetaFile)
+
+            # Method #3 Using the filterData functionality.. Might need to adjust a bit.. Not sure this is performing as expected..
+            # genotypeMatrix, _, sampleMeta = filterData(
+            #     inputCountsFile,
+            #     inputMetaFile,
+            #     minloci,
+            #     minSample,
+            # )
+            genotype_matrix_t = genotypeMatrix.T
+
+            consensusMatrix = pd.read_csv(
+                Path(outputDir).joinpath(f"{filePrefix}_consensus.csv")
+                # "./wheat_full/single_plant_output_2/wheat_full_consensus.csv"
+            )
+            consensus_df = consensusMatrix.set_index("cluster")
+            consensus_df.drop(columns="Majority_Class", inplace=True)
+
+            # filter down the full genotype matrix to only the specified ones...
+            excluded_cols = {"cluster", "Majority_Class"}
+            marker_cols = [
+                col for col in consensusMatrix.columns if col not in excluded_cols
+            ]
+            geno_cols = genotype_matrix_t.columns.to_list()
+            columns_to_keep = [
+                col for col in marker_cols if col != "short_name" and col in geno_cols
+            ]
+
+            genotype_matrix_filtered = genotype_matrix_t[columns_to_keep]
+
+            meta_subset = sampleMeta[["short_name", "reference"]].drop_duplicates(
+                subset=["short_name"]
+            )
+            # so that the merge functions properly...
+            meta_subset["short_name"] = (
+                meta_subset["short_name"].astype(str).str.strip()
+            )
+
+            cluster_map = meta_subset.set_index("short_name")["reference"].to_dict()
+            purity_results = []
+            CLUSTER_COL = "Majority_Class"
+
+            consensus_groups = {
+                cluster_id: group.drop(columns=[CLUSTER_COL], errors="ignore")
+                for cluster_id, group in consensusMatrix.groupby(CLUSTER_COL)
+            }
+            genotype_matrix_filtered.sort_index(inplace=True)
+            genotype_matrix_filtered.to_csv(
+                Path(outputDir).joinpath(f"{filePrefix}_filter_genos_temp.csv")
+            )
+
+            purity_matrix = calculate_purity_matrix(
+                genotype_matrix_filtered, consensus_df
+            )
+            # Find the index of the highest purity match for each raw genotype row
+            best_match_indices = np.argmax(purity_matrix, axis=1)
+            best_purities = np.max(purity_matrix, axis=1)
+
+            # Build results DataFrame
+            df_purity_scores = pd.DataFrame(
+                {
+                    "short_name": genotype_matrix_filtered.index,
+                    "assigned_cluster": [
+                        cluster_map.get(str(line_id))
+                        for line_id in genotype_matrix_filtered.index
+                    ],
+                    "best_consensus_id": consensus_df.index[best_match_indices],
+                    "purity_pct": best_purities,
+                }
+            )
+            # # Split into func
+            # purity_results = []
+
+            # for line_id, raw_geno_values in genotype_matrix_filtered.iterrows():
+            #     assigned_cluster = cluster_map.get(str(line_id))
+
+            #     # Skip missing cluster assignments or clusters not present in consensusMatrix
+            #     if (
+            #         pd.isna(assigned_cluster)
+            #         or assigned_cluster not in consensus_groups
+            #     ):
+            #         continue
+
+            #     # Retrieve all consensus rows corresponding to this cluster
+            #     matching_consensus_rows = consensus_groups[assigned_cluster]
+
+            #     best_purity = float("-inf")
+            #     best_consensus_id = None
+
+            #     # Calculate purity against each matching row and keep the maximum
+            #     for (
+            #         consensus_idx,
+            #         consensus_values,
+            #     ) in matching_consensus_rows.iterrows():
+            #         purity_pct = calculate_purity(raw_geno_values, consensus_values)
+
+            #         if purity_pct > best_purity:
+            #             best_purity = purity_pct
+            #             best_consensus_id = consensus_idx
+
+            #     purity_results.append(
+            #         {
+            #             "short_name": line_id,
+            #             "assigned_cluster": assigned_cluster,
+            #             "best_consensus_id": best_consensus_id,  # Index of the winning consensus row
+            #             "purity_pct": best_purity,
+            #         }
+            #     )
+
+            # 5. Convert back to a DataFrame
+            # df_purity_scores = pd.DataFrame(purity_results)
+
+            print(df_purity_scores)
+
+            df_purity_scores.to_csv(
+                Path(outputDir).joinpath(
+                    f"{filePrefix}_purity_scores_from consensus.csv"
+                )
+            )
+
+            # total_class_counts = df_purity_scores["variety"].value_counts()
+            # get_cluster_metrics()
+
+        case _:
+            raise ValueError(
+                f"pipelineName must be one of:\n 'clusteringForVarietyIdentification',\n 'revisedClusteringForVarietyIdentification',\n genotypeClusteringForPurityCalculation.\n I got {pipelineName}"
+            )
+    logging.info(f"Pipeline {pipelineName} completed successfully.")
+    logging.info(f"--------------------------")
+    # return (
+    #     snpProportion,
+    #     snpProportionNoInterpolation,
+    #     sampleMeta,
+    #     embedding,
+    #     db_communities,
+    #     output,
+    # )
 
 
 if __name__ == "__main__":
