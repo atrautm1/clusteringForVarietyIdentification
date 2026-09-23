@@ -110,5 +110,43 @@ def get_cluster_metrics(data, total_class_counts):
         {"Purity_%": 2, "Entropy": 3, "Recall_%": 2}
     )
 
-    logging.info(cluster_summary.to_string(index=False))
     return cluster_summary
+
+
+def plot_cluster_metrics(data, output_file):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Scatter plot: Size -> marker size, Entropy -> color
+    scatter = ax.scatter(
+        data["Purity_%"],
+        data["Recall_%"],
+        s=data["Size"] * 15,  # Bubble size scaling
+        c=data["Entropy"],  # Color mapping
+        cmap="viridis_r",
+        alpha=0.7,
+        edgecolors="black",
+        linewidth=1,
+    )
+
+    # Label points with majority class name and cluster ID
+    for _, row in data.iterrows():
+        ax.annotate(
+            f"C{int(row['cluster'])}: {row['Majority_Class']}",
+            (row["Purity_%"], row["Recall_%"]),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=8,
+        )
+
+    cbar = plt.colorbar(scatter)
+    cbar.set_label("Entropy (Lower is better)")
+
+    ax.set_xlabel("Group Assignment Purity % (assumed by 'reference')")
+    ax.set_ylabel("Recall (%)")
+    ax.set_title("Group Assignment Quality (Bubble Size = Cluster Size)")
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300)

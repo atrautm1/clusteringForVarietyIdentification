@@ -44,7 +44,7 @@ def run_pca_and_select_markers(df, n_keep=0.8, filePrefix="", outputDir="./outpu
     scaled_data = scaler.fit_transform(data_t)
 
     # Run PCA
-    # We only need the top 2 PCs to capture the primary variance drivers
+    # We will use the top 2 PCs to capture the primary variance drivers
     pca = PCA(n_components=2, random_state=42)
     pca.fit(scaled_data)
 
@@ -77,13 +77,10 @@ def run_pca_and_select_markers(df, n_keep=0.8, filePrefix="", outputDir="./outpu
         "Kept" if m in kept_markers else "Removed" for m in loading_df["Marker"]
     ]
 
-    logger.info(f"Total Kept: {len(kept_markers)}")
-    logger.info(f"Total Removed: {len(df) - len(kept_markers)}")
-
     # Graphical Output (The "Why")
     plt.figure(figsize=(10, 8))
 
-    # Plot the 'Removed' markers near the center
+    # Plot the 'Removed' markers in gray
     sns.scatterplot(
         data=loading_df[loading_df["Status"] == "Removed"],
         x="PC1_Loading",
@@ -94,7 +91,7 @@ def run_pca_and_select_markers(df, n_keep=0.8, filePrefix="", outputDir="./outpu
         label="Removed (Low Impact)",
     )
 
-    # Plot the 'Kept' markers on the outer edges
+    # Plot the 'Kept' markers in blue
     sns.scatterplot(
         data=loading_df[loading_df["Status"] == "Kept"],
         x="PC1_Loading",
